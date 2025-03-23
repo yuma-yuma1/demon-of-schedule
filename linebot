@@ -1,0 +1,207 @@
+
+
+// ★必須：LINEのチャネルアクセストークン (ロングターム) を指定
+var ACCESS_TOKEN = '5Mh/mBq/OtBoVvjzQvkc+klEqkpaCraGsd+YeemP7gMtHWvkdBvNFCG4Jwp4p7UoB16CX5cRN6zUn3SwGHAchm6Y3WfdSsUMmEi7YCXbyx2FrMa8NNMe2OjRJr/+xtyH85F/5y39jeFp6WXl5QABewdB04t89/1O/w1cDnyilFU='; // TODO: 実際の値に置き換えてください
+
+var GEMINI_API_KEY = 'AIzaSyD20YqN6CkwrOu1IsYowkYY5xzVisLgTyw';          // Gemini (Generative Language API) のAPIキー
+
+// Googleカスタム検索 (Custom Search JSON API) 用
+var GOOGLE_SEARCH_API_KEY = 'AIzaSyBoiISxTe4pZ42h0B4K2b6xYMzQj-iUitQ'; // Google Cloud上で取得したAPIキー
+var CUSTOM_SEARCH_ENGINE_ID = '62e5ae2b1bb26402e'; // カスタム検索エンジンのID (cx)
+/**
+ * LINE Messaging APIのWebhookエントリポイント (GAS側)
+ * 特定メッセージを受け取ったらURLを返信する
+ */
+// ********* LINE Webhook入口 *********
+function doPost(e) {
+  var data = JSON.parse(e.postData.contents);
+  data.events.forEach(function(event) {
+    // メッセージイベントかどうか
+    if (event.type === 'message' && event.message.type === 'text') {
+      var userMessage = event.message.text;
+      var replyToken = event.replyToken;
+
+      // 例: 「予定作成」と入力されたら 検索グラウンディング + Gemini で上位イベント情報を返す
+      if (userMessage === '予定作成') {
+        // スプレッドシートの読み込み
+        var sheet = readSheet();
+
+        var plans = getPlans(sheet, event.source.groupId);
+
+        var query = '2025-3-22 福岡 イベント'; // ユーザー入力に合わせて生成してもよい
+
+        // (1) Googleカスタム検索で上位5件を取得
+        var searchResults = doGoogleSearch(query);
+
+        // (2) その検索結果をGeminiに渡すため、プロンプト用テキストを作る
+        var geminiPrompt = createGroundedPrompt(query, searchResults);
+
+        // (3) Gemini API呼び出し
+        var geminiResponse = callGeminiAPI(geminiPrompt);
+
+        // (4) ユーザーに返信
+        replyMessage(replyToken, [
+          {
+            type: 'text',
+            text: geminiResponse
+          }
+        ]);
+      }
+
+      if (userMessage === 'カレンダー') {
+      // グループチャットの場合のみ groupId を使う
+        if (event.source.type === 'group') {
+          var groupId = event.source.groupId;
+          // クエリパラメータ付きURLにする
+          var urlToSend = 'https://script.google.com/macros/s/AKfycbwfTJABm2bDeFIR7SMXZAHounBxRFqWq8B-gsVtGWpBa2XZD-TEW-GSxcP10dm1J8gI/exec?groupId=' + groupId;
+        replyMessage(replyToken, [
+            {
+              type: 'imagemap',
+              baseUrl: 'https://raw.githubusercontent.com/yuma-yuma1/picture/refs/heads/main/Resized_oni_calendar_1040x1040.jpg?w=1040', // 公開画像へのベースURL(後述)
+              altText: '画像をタップすると日程調整ページへ移動します',
+              baseSize: {
+                width: 1040,
+                height: 1040
+              },
+              actions: [
+                {
+                  type: 'uri',
+                  linkUri: urlToSend,
+                  area: {
+                    x: 0,
+                    y: 0,
+                    width: 1040,
+                    height: 1040
+                  }
+                }
+              ]
+              
+            },
+            {
+              type: 'text',
+              text: 'ときは金なり。日程を決めぬものに幸せなし。'
+            }
+        ]);
+        }
+      }   
+
+    }
+  });
+
+
+}
+
+/**
+ * (1) Googleカスタム検索APIで上位5件を取得
+ */
+function doGoogleSearch(query) {
+  // APIエンドポイント
+  var url = 'https://customsearch.googleapis.com/customsearch/v1' +
+            '?key=' + GOOGLE_SEARCH_API_KEY +
+            '&cx=' + CUSTOM_SEARCH_ENGINE_ID +
+            '&q=' + encodeURIComponent(query) +
+            '&num=5'; // 上位5件のみ取得
+
+  var options = {
+    method: 'get',
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(url, options);
+  var json = JSON.parse(response.getContentText() || '{}');
+
+  // 検索結果を配列でまとめる
+  var results = [];
+  if (json.items && json.items.length > 0) {
+    json.items.forEach(function(item) {
+      results.push({
+        title: item.title,
+        link: item.link
+      });
+    });
+  }
+  return results;
+}
+
+/**
+ * (2) 検索結果をGeminiに渡すためのプロンプトを作る
+ *  (Search Grounding: 検索結果の内容を文脈として与える)
+ */
+function createGroundedPrompt(query, searchResults) {
+  // 検索結果をテキスト化
+  // ex) 1. Title: XXX Link: YYY
+  var contextText = '以下は「' + query + '」でのGoogle検索上位5件です:\n';
+  searchResults.forEach(function(r, i) {
+    contextText += (i+1) + '. ' + r.title + '\nURL: ' + r.link + '\n\n';
+  });
+
+  // Geminiへの指示 (まとめ方や表記方法は自由に変更可)
+  contextText += 'これらの検索結果を簡潔にまとめ、各イベントのURL、簡単な説明を表示して冒頭は「イベントを表示」から始めてください';
+  return contextText;
+}
+
+/**
+ * (3) Gemini APIを呼び出し、searchResultsを含めたプロンプトで回答を得る
+ */
+function callGeminiAPI(promptText) {
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-pro-exp-02-05:generateContent?key=' + GEMINI_API_KEY;
+
+  var payload = {
+    contents: [
+      {
+        parts: [
+          { text: promptText }
+        ]
+      }
+    ]
+  };
+
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(url, options);
+  var json = JSON.parse(response.getContentText() || '{}');
+
+  // Geminiの返す出力例: json.candidates[0].content.parts[0].text
+  var outputText = (json.candidates &&
+                    json.candidates[0] &&
+                    json.candidates[0].content &&
+                    json.candidates[0].content.parts &&
+                    json.candidates[0].content.parts[0].text) || '出力が取得できませんでした';
+
+  return outputText;
+}
+
+/**
+ * (4) LINEのReply APIでメッセージ返信
+ */
+function replyMessage(replyToken, messages) {
+  var url = 'https://api.line.me/v2/bot/message/reply';
+
+  var payload = {
+    replyToken: replyToken,
+    messages: messages
+  };
+
+  var options = {
+    method: 'post',
+    headers: {
+      'Authorization': 'Bearer ' + ACCESS_TOKEN,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(payload)
+  };
+
+  UrlFetchApp.fetch(url, options);
+}
+
+function readSheet(){
+  var spreadSheet = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty('ID_SHEET'));
+  var sheet = spreadSheet.getSheetByName('シート1');
+
+  return sheet;
+}
